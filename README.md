@@ -4,10 +4,17 @@ Una implementación de referencia, pequeña, para una sola pregunta: **¿cómo s
 evita que una consulta de limpieza corra contra la base de datos PostgreSQL
 equivocada, y cómo se demuestra que los datos se pueden recuperar si ocurre?**
 
+> **Plataforma.** Está construido para **Azure Database for PostgreSQL
+> (Flexible Server)**. El método de restauración tiene un ensayo real medido en
+> Azure ([números abajo](#un-ensayo-real-en-azure)). La sección
+> [Cómo adaptarlo a tu entorno](#cómo-adaptarlo-a-tu-entorno) incluye una guía
+> para **AWS RDS**, escrita con la documentación oficial de AWS pero **sin
+> probar** en una cuenta de AWS: hay que validarla antes de usarla.
+
 Todo usa nombres inventados (`pgdemo-*`, `appdb`) e identificadores en ceros.
 El Terraform valida y los controles se prueban contra un PostgreSQL 16 real en
-CI, pero nada se ha desplegado en una cuenta de nube. Ver
-[Lo que está verificado](#lo-que-está-verificado).
+CI; los workflows de este repositorio no se han ejecutado contra una
+suscripción. Ver [Lo que está verificado](#lo-que-está-verificado).
 
 ## El problema
 
@@ -64,6 +71,48 @@ lanza el workflow de migración.
 
 Las pruebas de base de datos repiten exactamente esta secuencia contra
 PostgreSQL 16: [`tests/test-database.sh`](tests/test-database.sh).
+
+### Un ensayo real en Azure
+
+El método de la prueba de restauración (dos marcadores, restaurar entre ellos,
+comparar) se ejecutó a mano en un laboratorio propio en Azure antes de
+escribir este repositorio. Datos registrados en esa corrida (7 de septiembre
+de 2026, UTC):
+
+| Dato | Valor |
+|---|---|
+| Servidor | Flexible Server, `Standard_B1ms` (Burstable), 32 GiB, PostgreSQL 17, retención de 7 días |
+| Marcadores | marker-1 escrito 00:52:20, marker-2 escrito 00:55:55 |
+| Restauración | PITR a un servidor nuevo, con punto de restauración entre los dos marcadores |
+| Resultado | la copia tenía marker-1 y **no** marker-2; el checksum de la copia (4 filas) difería del origen (5 filas), como se esperaba |
+| RTO medido | **≈ 8,5 minutos**, desde la creación del servidor restaurado (00:56:55) hasta que quedó disponible (01:05:21) |
+| Limpieza | el servidor restaurado se borró después de la verificación |
+
+Dos advertencias para leer bien el número. La base era mínima (unas pocas
+filas), así que esos 8,5 minutos son sobre todo el tiempo de aprovisionar un
+servidor nuevo; con datos reales el tiempo crece con el tamaño y la cantidad de
+WAL a reproducir. Y fue una corrida manual: el workflow `restore-test.yml`
+automatiza esos mismos pasos, pero todavía no se ha ejecutado contra una
+suscripción.
+
+## Por qué Terraform y GitHub Actions
+
+Nada de esto requiere esas dos herramientas; un runbook manual con las mismas
+verificaciones también funciona. Lo que cambia es de qué depende cada control:
+
+- **Con Terraform**, la retención, el lock y `prevent_destroy` quedan escritos
+  junto al servidor. Si alguien lo recrea o cambia un parámetro, el plan
+  muestra la diferencia antes de aplicarla, y `plan-gate.sh` la detiene si
+  implica borrar algo. Sin código, esas protecciones dependen de que alguien
+  recuerde configurarlas cada vez.
+- **Con GitHub Actions**, el destino fijado, las verificaciones y la prueba
+  mensual corren igual en cada ejecución, sin que nadie tenga credenciales
+  permanentes en su equipo. Cada corrida deja un registro (quién la lanzó, con
+  qué parámetros, qué respondieron los controles), que es justamente la
+  evidencia que pide una auditoría.
+
+El costo es mantener el código y los workflows al día con la plataforma. Para
+una sola base que casi no cambia, un runbook bien practicado puede bastar.
 
 ## Lo que esto no evita
 
@@ -209,6 +258,11 @@ Todos los nombres del repositorio son de ejemplo. Buscar `pgdemo`, `appdb` y
 
 ### AWS RDS
 
+> **Sin probar.** Esta guía se escribió contra la documentación oficial de AWS
+> CLI v2, IAM y GitHub, pero no se ha ejecutado en una cuenta de AWS. El módulo
+> `modules/postgres/aws` pasa `terraform validate`; los workflows de AWS no
+> existen todavía y hay que escribirlos con esta tabla.
+
 El módulo `modules/postgres/aws` ya incluye las protecciones. Los workflows
 están escritos para Azure; cada paso tiene un equivalente directo en AWS:
 
@@ -218,7 +272,7 @@ están escritos para Azure; cada paso tiene un equivalente directo en AWS:
 | Verificación de la suscripción | `aws sts get-caller-identity --query Account` comparado con un ID de cuenta fijado |
 | Token de Entra como contraseña | `aws rds generate-db-auth-token` (autenticación IAM a la base de datos) |
 | Regla de firewall temporal | `aws ec2 authorize-security-group-ingress` / `revoke-security-group-ingress` en `if: always()` |
-| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --restore-time`, luego `aws rds wait db-instance-available` |
+| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --source-db-instance-identifier ... --target-db-instance-identifier ... --restore-time ... --db-subnet-group-name ... --vpc-security-group-ids ...`, luego `aws rds wait db-instance-available` (ver puntos 6 y 7 abajo) |
 | `az postgres flexible-server delete` | `aws rds delete-db-instance --skip-final-snapshot --delete-automated-backups` (solo la instancia temporal) |
 | Lock `CanNotDelete` | `deletion_protection = true` |
 
@@ -238,10 +292,16 @@ Qué cambiar:
    aprobadas puedan asumirlo. Dar solo lo que cada workflow usa:
    - migrate: `rds-db:connect` para el único usuario de base de datos, y
      autorizar/revocar ingreso en el único security group (o nada, con un
-     runner en red privada);
-   - prueba de restauración: `rds:RestoreDBInstanceToPointInTime` desde el
-     origen, y `rds:DeleteDBInstance` limitado a
-     `arn:aws:rds:<región>:<cuenta>:db:<prefijo-de-restauración>*`.
+     runner en red privada). El ARN de `rds-db:connect` no usa el nombre de la
+     instancia sino su `DbiResourceId`:
+     `arn:aws:rds-db:<región>:<cuenta>:dbuser:<db-XXXXXXXX>/<usuario>`;
+   - prueba de restauración: `rds:RestoreDBInstanceToPointInTime` y
+     `rds:DeleteDBInstance`, idealmente limitados a
+     `arn:aws:rds:<región>:<cuenta>:db:<prefijo-de-restauración>*`. Qué
+     recursos acepta cada acción no está verificado: confirmarlo en la
+     *Service Authorization Reference* de Amazon RDS antes de confiar en esa
+     restricción, y mantener de todos modos la verificación del prefijo en el
+     paso de limpieza.
 4. **Usuarios de la base.** Ejecutar `sql/roles.sql` y `sql/ops.sql` como el
    usuario maestro (contraseña en Secrets Manager). Crear un login por
    workflow, darle `rds_iam` y luego `GRANT migrator` (migrate) o `GRANT app`
@@ -252,7 +312,16 @@ Qué cambiar:
    `EXPECTED_ENVIRONMENT`. Registrar los mismos valores en la base con
    `psql -v server_name=<identificador> -v environment=<ambiente> -f sql/ops.sql`.
    Fijar también el host del endpoint, en lugar de leerlo de un parámetro.
-6. **Meta de RTO.** Definir `RTO_TARGET_MINUTES` a partir de las primeras
+6. **Red de la instancia restaurada.** Si no se indica otra cosa, RDS crea la
+   instancia restaurada con el security group y el subnet group por defecto.
+   Pasar siempre `--db-subnet-group-name` y `--vpc-security-group-ids` (los
+   mismos privados del origen); si no, la copia puede quedar en la red
+   equivocada o inalcanzable para la validación.
+7. **Espera de la restauración.** `aws rds wait db-instance-available`
+   consulta cada 30 segundos y se rinde tras 60 intentos (unos 30 minutos)
+   con código 255. Con bases grandes, repetir la espera en un loop con un
+   límite propio, en lugar de tomar ese 255 como una restauración fallida.
+8. **Meta de RTO.** Definir `RTO_TARGET_MINUTES` a partir de las primeras
    ejecuciones medidas y, desde ahí, tratar cualquier exceso como falla.
 
 ### Azure
@@ -278,6 +347,8 @@ Qué cambiar:
 | `plan-gate.sh`, `sql-guard.sh` | Pruebas unitarias con fixtures |
 | Módulos y ejemplos de Terraform | `terraform fmt`, `terraform validate`, `tflint` |
 | Workflows | `actionlint`; los pasos de Azure **no** se han ejecutado contra una suscripción real |
+| Método de restauración en Azure | Ensayo manual medido (RTO ≈ 8,5 min, base mínima); ver [Un ensayo real en Azure](#un-ensayo-real-en-azure) |
+| Guía de AWS RDS | Revisada contra la documentación de AWS; **no** ejecutada en una cuenta de AWS |
 
 ## Licencia
 
