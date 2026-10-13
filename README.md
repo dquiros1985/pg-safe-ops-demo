@@ -1,157 +1,163 @@
 # pg-safe-ops-demo
 
-A small reference implementation of one question: **how do you stop a cleanup
-query from running against the wrong PostgreSQL database, and how do you prove
-you can get the data back if it does?**
+Una implementación de referencia, pequeña, para una sola pregunta: **¿cómo se
+evita que una consulta de limpieza corra contra la base de datos PostgreSQL
+equivocada, y cómo se demuestra que los datos se pueden recuperar si ocurre?**
 
-Everything here uses made-up names (`pgdemo-*`, `appdb`) and all-zero IDs. The
-Terraform validates and the guards are tested against a real PostgreSQL 16 in
-CI, but nothing has been deployed to a cloud account. See
-[What has been verified](#what-has-been-verified).
+Todo usa nombres inventados (`pgdemo-*`, `appdb`) e identificadores en ceros.
+El Terraform valida y los controles se prueban contra un PostgreSQL 16 real en
+CI, pero nada se ha desplegado en una cuenta de nube. Ver
+[Lo que está verificado](#lo-que-está-verificado).
 
-## The problem
+## El problema
 
-A `DELETE` meant for a scratch database runs against a shared one. Nobody
-wrote a malicious query; the failure is that every layer let it through:
+Un `DELETE` pensado para una base de pruebas corre contra una compartida. Nadie
+escribió una consulta maliciosa; la falla es que ninguna capa lo detuvo:
 
-1. **The target was implicit.** The connection came from an environment
-   variable, a pasted connection string or shell history. Nothing compared
-   "where I am" with "where I meant to be".
-2. **The identity could do anything.** The session ran as an owner or admin
-   role, so `DELETE`, `TRUNCATE` and `DROP` were all allowed.
-3. **Nothing asked twice.** A destructive statement looked the same to the
-   tooling as a harmless one.
-4. **Recovery was assumed, not proven.** Backups existed, but nobody knew how
-   long a restore takes or whether the restored data is complete.
+1. **El destino era implícito.** La conexión salió de una variable de entorno,
+   de una cadena de conexión pegada o del historial de la terminal. Nada
+   comparó "dónde estoy" con "dónde quería estar".
+2. **La identidad podía hacer cualquier cosa.** La sesión corría como dueño o
+   administrador, así que `DELETE`, `TRUNCATE` y `DROP` estaban permitidos.
+3. **Nada pidió confirmación.** Para las herramientas, una sentencia
+   destructiva se veía igual que una inofensiva.
+4. **La recuperación se suponía, no se había probado.** Había respaldos, pero
+   nadie sabía cuánto tarda una restauración ni si los datos restaurados
+   quedan completos.
 
-This repository puts a control on each of those four points, and a fifth one
-under all of them: the database server itself cannot be deleted by accident.
+Este repositorio pone un control en cada uno de esos cuatro puntos, y un quinto
+debajo de todos: el servidor de base de datos no se puede borrar por accidente.
 
-## How each piece prevents or recovers
+## Qué previene o recupera cada pieza
 
-| # | Control | Stops or recovers | Where |
+| # | Control | Qué evita o recupera | Dónde |
 |---|---|---|---|
-| 1 | **Pinned target.** The server, database, subscription and environment are constants in the workflow file. There is no input that overrides them; pointing the pipeline elsewhere takes a reviewed commit. | Prevents "wrong target" | [`migrate.yml`](.github/workflows/migrate.yml) `env:` |
-| 2 | **Target guard.** Before anything runs, the script asks the database who it is (`ops.instance_identity`, `current_database()`) and aborts on any mismatch with the pinned values. A database with no identity row is never a valid target. | Prevents "wrong target", even when a host name or variable is wrong | [`scripts/target-guard.sh`](scripts/target-guard.sh) |
-| 3 | **Role check.** The session must run as `migrator`. Superusers, `CREATEROLE`/`CREATEDB`/`BYPASSRLS` roles and members of admin roles are refused, even if they were "expected". | Prevents running with more power than needed | `target-guard.sh` |
-| 4 | **Least-privilege roles.** `app` can read and write rows but cannot `TRUNCATE`, `DROP`, `ALTER` or create objects. `migrator` owns the schema but cannot create roles or touch the identity row. `dbadmin` is break-glass only and inherits nothing until it runs `SET ROLE`. | Limits the blast radius | [`sql/roles.sql`](sql/roles.sql), [`sql/ops.sql`](sql/ops.sql) |
-| 5 | **Two-key destructive gate.** Any `DELETE`, `TRUNCATE` or `DROP` in pending migrations is refused unless the run sets `destructive=true` **and** types the pinned `<server>/<database>` into `confirm`. Comments, string literals and `ON DELETE CASCADE` do not count. | Makes a destructive run a deliberate act, aimed at a named target | [`scripts/sql-guard.sh`](scripts/sql-guard.sh) |
-| 6 | **Preview by default.** The default mode runs every pending file inside one transaction and rolls it back, so the log shows exactly what would happen. Apply uses the same single transaction and commits: all files or none. | Shows the effect before it is real | [`scripts/run-migrations.sh`](scripts/run-migrations.sh) |
-| 7 | **No stored credentials, short network window.** The workflow signs in with OIDC and gets a database token that expires within the hour. A firewall rule for the runner is opened for the run and closed in a step that runs even when the job fails (`if: always()`). | Removes standing access | `migrate.yml` |
-| 8 | **The server cannot be deleted by accident.** `prevent_destroy` stops Terraform; an Azure `CanNotDelete` lock (or RDS `deletion_protection`) stops everyone else, including someone with Owner rights clicking in the portal. A plan gate fails CI on any delete or replace. | Prevents losing the server and its backups | [`modules/postgres`](modules/postgres), [`scripts/plan-gate.sh`](scripts/plan-gate.sh) |
-| 9 | **Point-in-time restore window.** 7 days in dev, 35 (the Azure maximum) in prod, with backups optionally copied to the paired region. | Recovers from any of the above, to the second | `modules/postgres/azure` |
-| 10 | **Tested restore, every month.** A scheduled workflow restores the database to a temporary server, checks known marker rows by count and checksum, confirms that a row written *after* the restore point is absent, writes the measured RTO to the job summary, deletes the temporary server and opens an issue on failure. | Proves recovery works and how long it takes | [`restore-test.yml`](.github/workflows/restore-test.yml), [`scripts/restore-validate.sh`](scripts/restore-validate.sh) |
+| 1 | **Destino fijado.** Servidor, base de datos, suscripción y ambiente son constantes en el archivo del workflow. Ningún parámetro de entrada los cambia; apuntar el pipeline a otro lado requiere un commit revisado. | Evita el "destino equivocado" | [`migrate.yml`](.github/workflows/migrate.yml) `env:` |
+| 2 | **Verificación del destino.** Antes de ejecutar nada, el script le pregunta a la base quién es (`ops.instance_identity`, `current_database()`) y aborta si algo no coincide con los valores fijados. Una base sin fila de identidad nunca es un destino válido. | Evita el "destino equivocado", aunque el host o una variable estén mal | [`scripts/target-guard.sh`](scripts/target-guard.sh) |
+| 3 | **Verificación del rol.** La sesión debe correr como `migrator`. Se rechazan superusuarios, roles con `CREATEROLE`/`CREATEDB`/`BYPASSRLS` y miembros de roles de administración, aunque fueran los "esperados". | Evita correr con más poder del necesario | `target-guard.sh` |
+| 4 | **Roles de mínimo privilegio.** `app` lee y escribe filas, pero no puede hacer `TRUNCATE`, `DROP`, `ALTER` ni crear objetos. `migrator` es dueño del esquema, pero no puede crear roles ni tocar la fila de identidad. `dbadmin` es solo de emergencia y no hereda nada hasta que ejecuta `SET ROLE`. | Limita el alcance del daño | [`sql/roles.sql`](sql/roles.sql), [`sql/ops.sql`](sql/ops.sql) |
+| 5 | **Doble llave para lo destructivo.** Cualquier `DELETE`, `TRUNCATE` o `DROP` en las migraciones pendientes se rechaza, salvo que la ejecución marque `destructive=true` **y** se escriba en `confirm` el `<servidor>/<base>` fijado. Comentarios, textos entre comillas y `ON DELETE CASCADE` no cuentan. | Convierte una ejecución destructiva en un acto deliberado, contra un destino con nombre | [`scripts/sql-guard.sh`](scripts/sql-guard.sh) |
+| 6 | **Vista previa por defecto.** El modo por defecto ejecuta todos los archivos pendientes dentro de una transacción y la revierte, así el log muestra exactamente qué pasaría. El modo `apply` usa la misma transacción única y confirma: todos los archivos o ninguno. | Muestra el efecto antes de que sea real | [`scripts/run-migrations.sh`](scripts/run-migrations.sh) |
+| 7 | **Sin credenciales guardadas y ventana de red corta.** El workflow se autentica con OIDC y obtiene un token de base de datos que vence en menos de una hora. Se abre una regla de firewall para el runner durante la ejecución y se cierra en un paso que corre aunque el job falle (`if: always()`). | Elimina el acceso permanente | `migrate.yml` |
+| 8 | **El servidor no se puede borrar por accidente.** `prevent_destroy` detiene a Terraform; un lock `CanNotDelete` de Azure (o `deletion_protection` en RDS) detiene a todos los demás, incluso a alguien con rol Owner en el portal. Un control sobre el plan hace fallar el CI ante cualquier borrado o reemplazo. | Evita perder el servidor y sus respaldos | [`modules/postgres`](modules/postgres), [`scripts/plan-gate.sh`](scripts/plan-gate.sh) |
+| 9 | **Ventana de restauración a un punto en el tiempo (PITR).** 7 días en dev, 35 (el máximo de Azure) en prod, con copia opcional de los respaldos a la región emparejada. | Recupera de cualquiera de los casos anteriores, al segundo | `modules/postgres/azure` |
+| 10 | **Restauración probada, cada mes.** Un workflow programado restaura la base en un servidor temporal, compara filas marcadoras conocidas por cantidad y checksum, confirma que una fila escrita *después* del punto de restauración no aparece, registra el RTO medido en el resumen del job, borra el servidor temporal y abre un issue si algo falla. | Demuestra que la recuperación funciona y cuánto tarda | [`restore-test.yml`](.github/workflows/restore-test.yml), [`scripts/restore-validate.sh`](scripts/restore-validate.sh) |
 
-### The same mistake, replayed
+### El mismo error, repetido
 
-Someone adds `003_cleanup.sql` with `DELETE FROM app.customers WHERE ...` and
-starts the migrate workflow.
+Alguien agrega `003_cleanup.sql` con `DELETE FROM app.customers WHERE ...` y
+lanza el workflow de migración.
 
-- With the defaults, `sql-guard.sh` refuses before the workflow even signs in
-  to Azure, and prints the file and line.
-- With `destructive=true` but a wrong or empty `confirm`, it still refuses.
-- With the right confirmation, the run is in **preview** unless `apply` was
-  chosen: the `DELETE` runs, the log shows it, and it is rolled back.
-- If the workflow file were edited to point at another server, the target
-  guard compares the identity row of the database it reached and aborts; the
-  edit itself is a reviewed commit.
-- If all of that was intended and the statement was still wrong, the data
-  comes back with a point-in-time restore to just before the run, a procedure
-  the monthly test has already exercised and timed.
+- Con los valores por defecto, `sql-guard.sh` lo rechaza antes de que el
+  workflow siquiera se autentique en Azure, e indica archivo y línea.
+- Con `destructive=true` pero un `confirm` vacío o equivocado, también lo
+  rechaza.
+- Con la confirmación correcta, la ejecución queda en **vista previa** salvo
+  que se haya elegido `apply`: el `DELETE` corre, el log lo muestra y se
+  revierte.
+- Si alguien editara el workflow para apuntar a otro servidor, la verificación
+  del destino compara la fila de identidad de la base a la que llegó y aborta;
+  y la edición misma pasa por un commit revisado.
+- Si todo eso fue intencional y aun así la sentencia estaba mal, los datos se
+  recuperan con una restauración al momento previo a la ejecución, un
+  procedimiento que la prueba mensual ya ejecutó y cronometró.
 
-The database tests replay this exact sequence against PostgreSQL 16:
-[`tests/test-database.sh`](tests/test-database.sh).
+Las pruebas de base de datos repiten exactamente esta secuencia contra
+PostgreSQL 16: [`tests/test-database.sh`](tests/test-database.sh).
 
-## What this does not stop
+## Lo que esto no evita
 
-Being precise about the limits matters more than the list above.
+Ser precisos con los límites importa más que la lista anterior.
 
-- **Row-level mistakes by the application.** `app` keeps `DELETE` because most
-  applications need it. A buggy `DELETE` from the app is recovered with PITR,
-  not prevented. Tighten it per table if the app never deletes.
-- **Someone who removes the lock on purpose.** A lock raises the bar to a
-  separate, logged action (`Microsoft.Authorization/locks/delete`); it does
-  not stop an Owner who means it. Alert on that operation in the activity log.
-- **The SQL scanner is a heuristic.** It errs on the side of flagging (it also
-  flags `DROP DEFAULT`, or a `DELETE` inside a function body). It is a speed
-  bump in front of the role model, not a replacement for it.
-- **A restored copy carries the source identity row.** Before a restored server
-  is used for real, re-stamp it with `sql/ops.sql`, or the target guard would
-  accept it as the original.
-- **Retention is a hard edge.** A mistake noticed after 7 days in dev (35 in
-  prod) cannot be undone with PITR. Long-term retention needs a separate
-  backup (Azure Backup vaulted backups, or AWS Backup) with its own restore
-  test.
+- **Errores fila por fila de la aplicación.** `app` conserva `DELETE` porque la
+  mayoría de las aplicaciones lo necesita. Un `DELETE` defectuoso de la
+  aplicación se recupera con PITR, no se previene. Si la aplicación nunca
+  borra, conviene restringirlo por tabla.
+- **Alguien que quita el lock a propósito.** Un lock obliga a una acción
+  aparte y registrada (`Microsoft.Authorization/locks/delete`); no detiene a
+  un Owner decidido. Conviene alertar sobre esa operación en el registro de
+  actividad.
+- **El análisis del SQL es heurístico.** Prefiere marcar de más (también marca
+  `DROP DEFAULT` o un `DELETE` dentro del cuerpo de una función). Es un
+  reductor de velocidad delante del modelo de roles, no un reemplazo.
+- **Una copia restaurada lleva la fila de identidad del origen.** Antes de usar
+  un servidor restaurado en serio, hay que volver a marcarlo con
+  `sql/ops.sql`; si no, la verificación del destino lo aceptaría como el
+  original.
+- **La retención es un límite duro.** Un error que se descubre después de 7
+  días en dev (35 en prod) no se puede deshacer con PITR. La retención de
+  largo plazo requiere un respaldo aparte (respaldos en bóveda de Azure Backup,
+  o AWS Backup) con su propia prueba de restauración.
 
-### Lock scope and the firewall rule
+### Alcance del lock y la regla de firewall
 
-An Azure resource lock is inherited by child resources, and firewall rules are
-children of the server. With a `CanNotDelete` lock on the server, a pipeline
-can create its temporary firewall rule but cannot delete it afterwards. The
-module therefore takes `lock_scope`:
+En Azure, un lock se hereda a los recursos hijos, y las reglas de firewall son
+hijas del servidor. Con un lock `CanNotDelete` sobre el servidor, un pipeline
+puede crear su regla de firewall temporal, pero no puede borrarla después. Por
+eso el módulo recibe `lock_scope`:
 
-- `server` (prod example): the pipelines reach the database over a private
-  network, so there is no firewall rule to clean up.
-- `database` (dev example): the lock protects the database resource and the
-  pipelines open and close a firewall rule per run.
+- `server` (ejemplo de prod): los pipelines llegan a la base por red privada,
+  así que no hay regla de firewall que limpiar.
+- `database` (ejemplo de dev): el lock protege el recurso de la base de datos
+  y los pipelines abren y cierran una regla de firewall por ejecución.
 
-Set `NETWORK_MODE: private` in the workflows when you use `lock_scope =
-"server"`.
+Con `lock_scope = "server"`, poner `NETWORK_MODE: private` en los workflows.
 
-## SOC 2 mapping
+## Correspondencia con SOC 2
 
-SOC 2 does not prescribe a monthly restore test, an automated pipeline or a
-specific RTO. It asks the company to define controls that meet the Trust
-Services Criteria, and the auditor tests that those controls are designed
-appropriately and operated as described during the audit period. The
-frequency, the automation and the RTO target below are **choices the company
-makes**; the workflows make them repeatable and leave evidence.
+SOC 2 no exige una prueba de restauración mensual, un pipeline automatizado ni
+un RTO específico. Pide que la empresa defina controles que cumplan los Trust
+Services Criteria, y el auditor verifica que esos controles estén bien
+diseñados y que hayan operado como se describen durante el período auditado.
+La frecuencia, la automatización y la meta de RTO de abajo son **decisiones de
+la empresa**; los workflows las vuelven repetibles y dejan evidencia.
 
-The Availability criteria (A1) apply only if Availability is in the scope of
-the report.
+Los criterios de Disponibilidad (A1) aplican solo si Availability está dentro
+del alcance del informe.
 
-| Criterion | What it asks for (paraphrased) | Controls here | Evidence produced |
+| Criterio | Qué pide (parafraseado) | Controles aquí | Evidencia que queda |
 |---|---|---|---|
-| **A1.2** | Backup processes and recovery infrastructure are in place to meet availability commitments | PITR retention per environment, optional geo-redundant backups, delete lock / deletion protection, `prevent_destroy` | Terraform code and plan history; lock and retention visible in the cloud console |
-| **A1.3** | Recovery plan procedures are tested | Monthly `restore-test` with data validation and a measured RTO against a target | Job summary per run (restore point, duration, checks); an issue for every failed run |
-| **CC8.1** | Changes to infrastructure, data and software are authorized, tested, approved and implemented in a controlled way | Pinned target, preview by default, two-key destructive gate, environment approval before credentials are issued, plan gate that fails on deletes | Workflow run history: who started it, inputs, guard output, approval |
-| **CC6.1** | Logical and network access to protected assets is restricted | OIDC with short-lived tokens instead of stored secrets, per-run firewall rule closed on exit, `REVOKE ... FROM PUBLIC` | Workflow logs, firewall rule lifecycle in the activity log |
-| **CC6.3** | Access is role-based, follows least privilege, and supports segregation of duties | Roles `dbadmin` / `migrator` / `app`, pipeline identity mapped to `migrator` only, break-glass through an explicit `SET ROLE` | `sql/roles.sql`, target-guard output in every run |
+| **A1.2** | Procesos de respaldo e infraestructura de recuperación que permitan cumplir los compromisos de disponibilidad | Retención PITR por ambiente, respaldo geo-redundante opcional, lock de borrado / deletion protection, `prevent_destroy` | Código Terraform e historial de planes; lock y retención visibles en la consola de la nube |
+| **A1.3** | Se prueban los procedimientos del plan de recuperación | `restore-test` mensual con validación de datos y RTO medido contra una meta | Resumen de cada ejecución (punto de restauración, duración, verificaciones); un issue por cada ejecución fallida |
+| **CC8.1** | Los cambios en infraestructura, datos y software se autorizan, prueban, aprueban e implementan de forma controlada | Destino fijado, vista previa por defecto, doble llave para lo destructivo, aprobación del ambiente antes de emitir credenciales, control de plan que falla ante borrados | Historial de ejecuciones: quién la lanzó, parámetros, salida de los controles, aprobación |
+| **CC6.1** | El acceso lógico y de red a los activos protegidos está restringido | OIDC con tokens de corta duración en lugar de secretos guardados, regla de firewall por ejecución que se cierra al salir, `REVOKE ... FROM PUBLIC` | Logs de los workflows, ciclo de vida de la regla de firewall en el registro de actividad |
+| **CC6.3** | El acceso se basa en roles, sigue el mínimo privilegio y permite segregación de funciones | Roles `dbadmin` / `migrator` / `app`, identidad del pipeline asociada solo a `migrator`, acceso de emergencia mediante un `SET ROLE` explícito | `sql/roles.sql`, salida de `target-guard` en cada ejecución |
 
-GitHub keeps workflow logs for 90 days by default (configurable). If the audit
-period is longer, export the run summaries somewhere with matching retention.
+GitHub conserva los logs de los workflows 90 días por defecto (configurable).
+Si el período de auditoría es más largo, exportar los resúmenes a un lugar con
+retención equivalente.
 
-## Repository layout
+## Estructura del repositorio
 
 ```text
 .
 ├── .github/workflows/
-│   ├── ci.yml              fmt, validate, tflint, shellcheck, actionlint, tests, gitleaks
-│   ├── migrate.yml         manual migrations: pinned target, preview default, guards
-│   └── restore-test.yml    monthly PITR restore, validation, RTO, cleanup, issue
+│   ├── ci.yml              fmt, validate, tflint, shellcheck, actionlint, pruebas, gitleaks
+│   ├── migrate.yml         migraciones manuales: destino fijado, vista previa, controles
+│   └── restore-test.yml    restauración PITR mensual, validación, RTO, limpieza, issue
 ├── examples/
-│   ├── azure-dev/          7-day PITR, lock on the database, firewall mode
-│   ├── azure-prod/         35-day PITR, geo backup, lock on the server
-│   └── aws-prod/           the same protections on RDS
-├── migrations/             sample schema migrations
+│   ├── azure-dev/          PITR de 7 días, lock en la base, modo firewall
+│   ├── azure-prod/         PITR de 35 días, respaldo geo, lock en el servidor
+│   └── aws-prod/           las mismas protecciones en RDS
+├── migrations/             migraciones de ejemplo
 ├── modules/postgres/
-│   ├── azure/              Flexible Server, Entra auth, lock, prevent_destroy
-│   └── aws/                RDS, deletion_protection, final snapshot, prevent_destroy
+│   ├── azure/              Flexible Server, autenticación Entra, lock, prevent_destroy
+│   └── aws/                RDS, deletion_protection, snapshot final, prevent_destroy
 ├── scripts/
-│   ├── plan-gate.sh        fail on any delete or replace in a Terraform plan
-│   ├── restore-validate.sh compare markers between source and restored copy
-│   ├── run-migrations.sh   guards, then one transaction: rollback or commit
-│   ├── sql-guard.sh        two-key gate for DELETE / TRUNCATE / DROP
-│   └── target-guard.sh     identity, database and role check
+│   ├── plan-gate.sh        falla ante cualquier borrado o reemplazo en un plan de Terraform
+│   ├── restore-validate.sh compara marcadores entre el origen y la copia restaurada
+│   ├── run-migrations.sh   controles, luego una sola transacción: revertir o confirmar
+│   ├── sql-guard.sh        doble llave para DELETE / TRUNCATE / DROP
+│   └── target-guard.sh     verificación de identidad, base de datos y rol
 ├── sql/
-│   ├── ops.sql             identity row, migration log, restore markers
+│   ├── ops.sql             fila de identidad, registro de migraciones, marcadores
 │   └── roles.sql           dbadmin / migrator / app
-└── tests/                  unit tests and PostgreSQL integration tests
+└── tests/                  pruebas unitarias y de integración con PostgreSQL
 ```
 
-## Running the tests
+## Cómo correr las pruebas
 
-The unit tests need `bash`, `jq` and `perl`:
+Las pruebas unitarias necesitan `bash`, `jq` y `perl`:
 
 ```bash
 tests/test-plan-gate.sh
@@ -161,8 +167,8 @@ tests/test-plan-gate.sh
 tests/test-sql-guard.sh
 ```
 
-The database tests need a **throwaway** PostgreSQL 16 superuser. They drop and
-recreate `appdb`, `appdb_restored` and the three roles:
+Las pruebas de base de datos necesitan un superusuario de un PostgreSQL 16
+**desechable**. Borran y recrean `appdb`, `appdb_restored` y los tres roles:
 
 ```bash
 docker run -d --rm --name pgdemo-test -e POSTGRES_PASSWORD=localtestonly -p 55432:5432 postgres:16
@@ -172,103 +178,107 @@ docker run -d --rm --name pgdemo-test -e POSTGRES_PASSWORD=localtestonly -p 5543
 PGHOST=localhost PGPORT=55432 PGUSER=postgres PGPASSWORD=localtestonly REQUIRE_DB=1 tests/run.sh
 ```
 
-Use the plan gate on a real plan:
+Para usar el control de plan sobre un plan real:
 
 ```bash
 terraform plan -out=plan.tfplan && terraform show -json plan.tfplan | scripts/plan-gate.sh
 ```
 
-## Using it for real
+## Uso real en Azure
 
-What the workflows expect, none of which is a stored secret:
+Lo que esperan los workflows; nada de esto es un secreto guardado:
 
-1. A Microsoft Entra app registration with a **federated credential** for
-   this repository and the GitHub environment (`pgdemo-dev`,
-   `pgdemo-restore-test`). Its client and tenant IDs go in the repository
-   variables `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`.
-2. Azure RBAC for that identity: read the server and manage its firewall rules
-   (migrate); restore and delete servers in the resource group (restore test).
-3. GitHub environments with required reviewers, so a person approves each run
-   before any credential is issued.
-4. In the database, as the Entra admin group: run `sql/roles.sql` and
-   `sql/ops.sql`, create the workflow principals with
-   `pgaadauth_create_principal`, then `GRANT migrator TO "gh-pgdemo-migrator"`
-   and `GRANT app TO "gh-pgdemo-restore-check"`.
+1. Un registro de aplicación de Microsoft Entra con una **credencial
+   federada** para este repositorio y cada ambiente de GitHub (`pgdemo-dev`,
+   `pgdemo-restore-test`). Sus IDs de cliente y de tenant van en las variables
+   del repositorio `AZURE_CLIENT_ID` y `AZURE_TENANT_ID`.
+2. Permisos RBAC de Azure para esa identidad: leer el servidor y administrar
+   sus reglas de firewall (migrate); restaurar y borrar servidores en el grupo
+   de recursos (prueba de restauración).
+3. Ambientes de GitHub con revisores obligatorios, para que una persona
+   apruebe cada ejecución antes de que se emita cualquier credencial.
+4. En la base de datos, como el grupo administrador de Entra: ejecutar
+   `sql/roles.sql` y `sql/ops.sql`, crear los principales de los workflows con
+   `pgaadauth_create_principal`, y luego `GRANT migrator TO "gh-pgdemo-migrator"`
+   y `GRANT app TO "gh-pgdemo-restore-check"`.
 
-## Adapting this to your environment
+## Cómo adaptarlo a tu entorno
 
-Every name in this repository is a placeholder. Search for `pgdemo`, `appdb`
-and `00000000` to find them all.
+Todos los nombres del repositorio son de ejemplo. Buscar `pgdemo`, `appdb` y
+`00000000` para encontrarlos todos.
 
 ### AWS RDS
 
-The module in `modules/postgres/aws` already carries the protections. The
-workflows are written for Azure; each step has a direct AWS equivalent:
+El módulo `modules/postgres/aws` ya incluye las protecciones. Los workflows
+están escritos para Azure; cada paso tiene un equivalente directo en AWS:
 
-| Azure step | AWS equivalent |
+| Paso en Azure | Equivalente en AWS |
 |---|---|
-| `azure/login` with OIDC | `aws-actions/configure-aws-credentials` with `role-to-assume` |
-| Subscription check | `aws sts get-caller-identity --query Account` compared with a pinned account ID |
-| Entra token as the password | `aws rds generate-db-auth-token` (IAM database authentication) |
-| Temporary firewall rule | `aws ec2 authorize-security-group-ingress` / `revoke-security-group-ingress` in `if: always()` |
-| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --restore-time`, then `aws rds wait db-instance-available` |
-| `az postgres flexible-server delete` | `aws rds delete-db-instance --skip-final-snapshot --delete-automated-backups` (temporary instance only) |
-| `CanNotDelete` lock | `deletion_protection = true` |
+| `azure/login` con OIDC | `aws-actions/configure-aws-credentials` con `role-to-assume` |
+| Verificación de la suscripción | `aws sts get-caller-identity --query Account` comparado con un ID de cuenta fijado |
+| Token de Entra como contraseña | `aws rds generate-db-auth-token` (autenticación IAM a la base de datos) |
+| Regla de firewall temporal | `aws ec2 authorize-security-group-ingress` / `revoke-security-group-ingress` en `if: always()` |
+| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --restore-time`, luego `aws rds wait db-instance-available` |
+| `az postgres flexible-server delete` | `aws rds delete-db-instance --skip-final-snapshot --delete-automated-backups` (solo la instancia temporal) |
+| Lock `CanNotDelete` | `deletion_protection = true` |
 
-What to change:
+Qué cambiar:
 
-1. **Names.** In `examples/aws-prod/main.tf`: `identifier`, `db_subnet_group_name`,
-   `vpc_security_group_ids`, region. Keep the restore prefix
-   (`RESTORE_PREFIX` in `restore-test.yml`) distinct from every real instance
-   name, because the cleanup step deletes anything that starts with it.
-2. **Retention.** `backup_retention_period` per environment, 1 to 35 days.
-   Pick it from how late a mistake could be noticed, not from cost alone.
-3. **OIDC role.** Create an IAM OIDC provider for
-   `token.actions.githubusercontent.com` and one role per workflow. Restrict
-   the trust policy's `sub` claim to
-   `repo:<owner>/<repo>:environment:<environment>`, so only approved runs can
-   assume it. Grant only what each workflow does:
-   - migrate: `rds-db:connect` for the one database user, and ingress
-     authorize/revoke on the one security group (or nothing, with a private
-     runner);
-   - restore test: `rds:RestoreDBInstanceToPointInTime` from the source, and
-     `rds:DeleteDBInstance` limited to `arn:aws:rds:<region>:<account>:db:<restore-prefix>*`.
-4. **Database users.** Run `sql/roles.sql` and `sql/ops.sql` as the master
-   user (password in Secrets Manager). Create one login per workflow, give it
-   `rds_iam`, then `GRANT migrator` (migrate) or `GRANT app` (restore test) to it.
-5. **Target pin.** In both workflow files, replace the subscription and
-   resource group with the AWS account ID and region, and set
-   `EXPECTED_SERVER` to the RDS identifier, `EXPECTED_DATABASE` and
-   `EXPECTED_ENVIRONMENT`. Stamp the same values into the database with
-   `psql -v server_name=<identifier> -v environment=<env> -f sql/ops.sql`.
-   Pin the endpoint host too, rather than reading it from an input.
-6. **RTO target.** Set `RTO_TARGET_MINUTES` from the first few measured runs,
-   then treat a breach as a failure.
+1. **Nombres.** En `examples/aws-prod/main.tf`: `identifier`,
+   `db_subnet_group_name`, `vpc_security_group_ids` y la región. El prefijo de
+   restauración (`RESTORE_PREFIX` en `restore-test.yml`) debe ser distinto del
+   nombre de toda instancia real, porque el paso de limpieza borra cualquier
+   instancia que empiece con él.
+2. **Retención.** `backup_retention_period` por ambiente, de 1 a 35 días.
+   Elegirla según cuánto se podría tardar en notar un error, no solo por costo.
+3. **Rol OIDC.** Crear un proveedor OIDC de IAM para
+   `token.actions.githubusercontent.com` y un rol por workflow. Restringir el
+   claim `sub` de la trust policy a
+   `repo:<owner>/<repo>:environment:<ambiente>`, para que solo las ejecuciones
+   aprobadas puedan asumirlo. Dar solo lo que cada workflow usa:
+   - migrate: `rds-db:connect` para el único usuario de base de datos, y
+     autorizar/revocar ingreso en el único security group (o nada, con un
+     runner en red privada);
+   - prueba de restauración: `rds:RestoreDBInstanceToPointInTime` desde el
+     origen, y `rds:DeleteDBInstance` limitado a
+     `arn:aws:rds:<región>:<cuenta>:db:<prefijo-de-restauración>*`.
+4. **Usuarios de la base.** Ejecutar `sql/roles.sql` y `sql/ops.sql` como el
+   usuario maestro (contraseña en Secrets Manager). Crear un login por
+   workflow, darle `rds_iam` y luego `GRANT migrator` (migrate) o `GRANT app`
+   (prueba de restauración).
+5. **Destino fijado.** En los dos workflows, reemplazar la suscripción y el
+   grupo de recursos por el ID de cuenta y la región de AWS, y poner en
+   `EXPECTED_SERVER` el identificador de RDS, además de `EXPECTED_DATABASE` y
+   `EXPECTED_ENVIRONMENT`. Registrar los mismos valores en la base con
+   `psql -v server_name=<identificador> -v environment=<ambiente> -f sql/ops.sql`.
+   Fijar también el host del endpoint, en lugar de leerlo de un parámetro.
+6. **Meta de RTO.** Definir `RTO_TARGET_MINUTES` a partir de las primeras
+   ejecuciones medidas y, desde ahí, tratar cualquier exceso como falla.
 
 ### Azure
 
-1. **Names.** `name`, `resource_group_name`, `location`, `entra_admin_*` and
-   the all-zero IDs in `examples/azure-*/main.tf`.
-2. **Retention.** `backup_retention_days` (7 to 35) and
-   `geo_redundant_backup_enabled`, which can only be set when the server is
-   created.
-3. **OIDC.** An Entra app registration with a federated credential per
-   GitHub environment; its IDs go in the `AZURE_CLIENT_ID` and
-   `AZURE_TENANT_ID` repository variables.
-4. **Target pin.** The `env:` block at the top of both workflows, plus
-   `sql/ops.sql` with the matching server name and environment.
-5. **Network.** `lock_scope` and `NETWORK_MODE` together, as described in
-   [Lock scope and the firewall rule](#lock-scope-and-the-firewall-rule).
+1. **Nombres.** `name`, `resource_group_name`, `location`, `entra_admin_*` y
+   los IDs en ceros de `examples/azure-*/main.tf`.
+2. **Retención.** `backup_retention_days` (7 a 35) y
+   `geo_redundant_backup_enabled`, que solo se puede definir al crear el
+   servidor.
+3. **OIDC.** Un registro de aplicación de Entra con una credencial federada
+   por ambiente de GitHub; sus IDs van en las variables del repositorio
+   `AZURE_CLIENT_ID` y `AZURE_TENANT_ID`.
+4. **Destino fijado.** El bloque `env:` al inicio de los dos workflows, más
+   `sql/ops.sql` con el nombre de servidor y el ambiente correspondientes.
+5. **Red.** `lock_scope` y `NETWORK_MODE` en conjunto, como se explica en
+   [Alcance del lock y la regla de firewall](#alcance-del-lock-y-la-regla-de-firewall).
 
-## What has been verified
+## Lo que está verificado
 
-| Piece | Status |
+| Pieza | Estado |
 |---|---|
-| `sql/roles.sql`, `sql/ops.sql`, all guards, `run-migrations.sh`, `restore-validate.sh` | Tested against PostgreSQL 16 (`tests/test-database.sh`) |
-| `plan-gate.sh`, `sql-guard.sh` | Unit-tested with fixtures |
-| Terraform modules and examples | `terraform fmt`, `terraform validate`, `tflint` |
-| Workflows | `actionlint`; the Azure steps have **not** been run against a real subscription |
+| `sql/roles.sql`, `sql/ops.sql`, todos los controles, `run-migrations.sh`, `restore-validate.sh` | Probados contra PostgreSQL 16 (`tests/test-database.sh`) |
+| `plan-gate.sh`, `sql-guard.sh` | Pruebas unitarias con fixtures |
+| Módulos y ejemplos de Terraform | `terraform fmt`, `terraform validate`, `tflint` |
+| Workflows | `actionlint`; los pasos de Azure **no** se han ejecutado contra una suscripción real |
 
-## License
+## Licencia
 
-MIT, see [LICENSE](LICENSE).
+MIT, ver [LICENSE](LICENSE).
