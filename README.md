@@ -195,19 +195,70 @@ What the workflows expect, none of which is a stored secret:
    `pgaadauth_create_principal`, then `GRANT migrator TO "gh-pgdemo-migrator"`
    and `GRANT app TO "gh-pgdemo-restore-check"`.
 
-### On AWS
+## Adapting this to your environment
 
-The module in `modules/postgres/aws` carries the same protections. The
-workflows map one to one:
+Every name in this repository is a placeholder. Search for `pgdemo`, `appdb`
+and `00000000` to find them all.
+
+### AWS RDS
+
+The module in `modules/postgres/aws` already carries the protections. The
+workflows are written for Azure; each step has a direct AWS equivalent:
 
 | Azure step | AWS equivalent |
 |---|---|
-| `azure/login` with OIDC | `aws-actions/configure-aws-credentials` with a GitHub OIDC role |
+| `azure/login` with OIDC | `aws-actions/configure-aws-credentials` with `role-to-assume` |
+| Subscription check | `aws sts get-caller-identity --query Account` compared with a pinned account ID |
 | Entra token as the password | `aws rds generate-db-auth-token` (IAM database authentication) |
-| Temporary firewall rule | Temporary security group ingress rule, revoked in `if: always()` |
-| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --restore-time` |
+| Temporary firewall rule | `aws ec2 authorize-security-group-ingress` / `revoke-security-group-ingress` in `if: always()` |
+| `az postgres flexible-server restore --restore-time` | `aws rds restore-db-instance-to-point-in-time --restore-time`, then `aws rds wait db-instance-available` |
+| `az postgres flexible-server delete` | `aws rds delete-db-instance --skip-final-snapshot --delete-automated-backups` (temporary instance only) |
 | `CanNotDelete` lock | `deletion_protection = true` |
-| `backup_retention_days` | `backup_retention_period` |
+
+What to change:
+
+1. **Names.** In `examples/aws-prod/main.tf`: `identifier`, `db_subnet_group_name`,
+   `vpc_security_group_ids`, region. Keep the restore prefix
+   (`RESTORE_PREFIX` in `restore-test.yml`) distinct from every real instance
+   name, because the cleanup step deletes anything that starts with it.
+2. **Retention.** `backup_retention_period` per environment, 1 to 35 days.
+   Pick it from how late a mistake could be noticed, not from cost alone.
+3. **OIDC role.** Create an IAM OIDC provider for
+   `token.actions.githubusercontent.com` and one role per workflow. Restrict
+   the trust policy's `sub` claim to
+   `repo:<owner>/<repo>:environment:<environment>`, so only approved runs can
+   assume it. Grant only what each workflow does:
+   - migrate: `rds-db:connect` for the one database user, and ingress
+     authorize/revoke on the one security group (or nothing, with a private
+     runner);
+   - restore test: `rds:RestoreDBInstanceToPointInTime` from the source, and
+     `rds:DeleteDBInstance` limited to `arn:aws:rds:<region>:<account>:db:<restore-prefix>*`.
+4. **Database users.** Run `sql/roles.sql` and `sql/ops.sql` as the master
+   user (password in Secrets Manager). Create one login per workflow, give it
+   `rds_iam`, then `GRANT migrator` (migrate) or `GRANT app` (restore test) to it.
+5. **Target pin.** In both workflow files, replace the subscription and
+   resource group with the AWS account ID and region, and set
+   `EXPECTED_SERVER` to the RDS identifier, `EXPECTED_DATABASE` and
+   `EXPECTED_ENVIRONMENT`. Stamp the same values into the database with
+   `psql -v server_name=<identifier> -v environment=<env> -f sql/ops.sql`.
+   Pin the endpoint host too, rather than reading it from an input.
+6. **RTO target.** Set `RTO_TARGET_MINUTES` from the first few measured runs,
+   then treat a breach as a failure.
+
+### Azure
+
+1. **Names.** `name`, `resource_group_name`, `location`, `entra_admin_*` and
+   the all-zero IDs in `examples/azure-*/main.tf`.
+2. **Retention.** `backup_retention_days` (7 to 35) and
+   `geo_redundant_backup_enabled`, which can only be set when the server is
+   created.
+3. **OIDC.** An Entra app registration with a federated credential per
+   GitHub environment; its IDs go in the `AZURE_CLIENT_ID` and
+   `AZURE_TENANT_ID` repository variables.
+4. **Target pin.** The `env:` block at the top of both workflows, plus
+   `sql/ops.sql` with the matching server name and environment.
+5. **Network.** `lock_scope` and `NETWORK_MODE` together, as described in
+   [Lock scope and the firewall rule](#lock-scope-and-the-firewall-rule).
 
 ## What has been verified
 
@@ -217,3 +268,7 @@ workflows map one to one:
 | `plan-gate.sh`, `sql-guard.sh` | Unit-tested with fixtures |
 | Terraform modules and examples | `terraform fmt`, `terraform validate`, `tflint` |
 | Workflows | `actionlint`; the Azure steps have **not** been run against a real subscription |
+
+## License
+
+MIT, see [LICENSE](LICENSE).
