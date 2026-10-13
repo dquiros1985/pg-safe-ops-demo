@@ -1,0 +1,12 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.8",
+  "resource_changes": [
+    {
+      "address": "module.postgres.azurerm_postgresql_flexible_server_database.this",
+      "type": "azurerm_postgresql_flexible_server_database",
+      "action_reason": "replace_because_cannot_update",
+      "change": { "actions": ["delete", "create"] }
+    }
+  ]
+}
