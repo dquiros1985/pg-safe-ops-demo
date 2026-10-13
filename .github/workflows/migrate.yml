@@ -1,0 +1,154 @@
+# Runs the SQL files in migrations/ against ONE database, pinned below.
+#
+# - Started by hand only. Preview is the default: everything runs inside a
+#   transaction that is rolled back, so the log shows what would happen.
+# - Signs in to Azure with OIDC. There is no stored password or client secret.
+# - Aborts unless the database it reaches says it is the pinned server and
+#   the session runs as the low-privilege migrator role.
+# - DELETE, TRUNCATE and DROP need destructive=true AND the pinned
+#   "<server>/<database>" typed into confirm.
+# - The temporary firewall opening is closed in a step that always runs.
+name: migrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preview = run and roll back; apply = run and commit"
+        type: choice
+        options: [preview, apply]
+        default: preview
+      destructive:
+        description: "Allow DELETE / TRUNCATE / DROP in the pending migrations"
+        type: boolean
+        default: false
+      confirm:
+        description: "Required with destructive: type the target exactly, as <server>/<database>"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: migrate-pgdemo-dev
+  cancel-in-progress: false
+
+env:
+  # The pinned target. Pointing this workflow anywhere else takes a reviewed
+  # commit to this file; there is no input that overrides it.
+  EXPECTED_SUBSCRIPTION_ID: "00000000-0000-0000-0000-000000000000"
+  EXPECTED_RESOURCE_GROUP: rg-pgdemo-dev
+  EXPECTED_SERVER: pgdemo-dev-psql
+  EXPECTED_DATABASE: appdb
+  EXPECTED_ENVIRONMENT: dev
+  EXPECTED_ROLE: migrator
+  # Entra identity of this workflow, granted the migrator role in the database.
+  DB_PRINCIPAL: gh-pgdemo-migrator
+  # firewall = open a rule for this runner and close it at the end.
+  # private  = the runner already reaches the server over a private network.
+  NETWORK_MODE: firewall
+
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The environment's protection rules (required reviewers, allowed
+    # branches) gate every run before any credential is issued.
+    environment: pgdemo-dev
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check destructive statements before touching Azure
+        env:
+          DESTRUCTIVE: ${{ inputs.destructive }}
+          CONFIRM: ${{ inputs.confirm }}
+          EXPECTED_TARGET: ${{ env.EXPECTED_SERVER }}/${{ env.EXPECTED_DATABASE }}
+        run: scripts/sql-guard.sh migrations/*.sql
+
+      - name: Sign in to Azure (OIDC, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.EXPECTED_SUBSCRIPTION_ID }}
+
+      - name: Check subscription and server
+        run: |
+          actual_sub=$(az account show --query id -o tsv)
+          if [ "$actual_sub" != "$EXPECTED_SUBSCRIPTION_ID" ]; then
+            echo "::error::signed in to subscription $actual_sub, expected $EXPECTED_SUBSCRIPTION_ID"
+            exit 1
+          fi
+          fqdn=$(az postgres flexible-server show \
+            --resource-group "$EXPECTED_RESOURCE_GROUP" --name "$EXPECTED_SERVER" \
+            --query fullyQualifiedDomainName -o tsv)
+          if [ -z "$fqdn" ]; then
+            echo "::error::server $EXPECTED_SERVER not found in $EXPECTED_RESOURCE_GROUP"
+            exit 1
+          fi
+          echo "PGHOST=$fqdn" >>"$GITHUB_ENV"
+
+      - name: Open firewall for this runner
+        id: firewall
+        if: env.NETWORK_MODE == 'firewall'
+        run: |
+          ip=$(curl -fsS https://api.ipify.org)
+          rule="gh-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "rule=$rule" >>"$GITHUB_OUTPUT"
+          az postgres flexible-server firewall-rule create \
+            --resource-group "$EXPECTED_RESOURCE_GROUP" --server-name "$EXPECTED_SERVER" \
+            --name "$rule" --start-ip-address "$ip" --end-ip-address "$ip" -o none
+
+      - name: Get a short-lived database token
+        run: |
+          token=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          echo "PGPASSWORD=$token" >>"$GITHUB_ENV"
+
+      - name: Check target and role
+        env:
+          PGUSER: ${{ env.DB_PRINCIPAL }}
+          PGDATABASE: ${{ env.EXPECTED_DATABASE }}
+          PGSSLMODE: require
+          # Every statement in this session runs as migrator, not as the
+          # workflow identity itself.
+          PGOPTIONS: -c role=migrator
+        run: scripts/target-guard.sh
+
+      - name: Run migrations (${{ inputs.mode }})
+        env:
+          PGUSER: ${{ env.DB_PRINCIPAL }}
+          PGDATABASE: ${{ env.EXPECTED_DATABASE }}
+          PGSSLMODE: require
+          PGOPTIONS: -c role=migrator
+          DESTRUCTIVE: ${{ inputs.destructive }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: scripts/run-migrations.sh "${{ inputs.mode }}" migrations
+
+      - name: Write a restore marker after an apply
+        if: success() && inputs.mode == 'apply'
+        env:
+          PGUSER: ${{ env.DB_PRINCIPAL }}
+          PGDATABASE: ${{ env.EXPECTED_DATABASE }}
+          PGSSLMODE: require
+          PGOPTIONS: -c role=migrator
+        run: psql -X -A -t -v ON_ERROR_STOP=1 -c "SELECT ops.write_marker('migrate-run-${GITHUB_RUN_ID}')"
+
+      - name: Close firewall
+        if: always() && steps.firewall.outputs.rule != ''
+        env:
+          RULE: ${{ steps.firewall.outputs.rule }}
+        run: |
+          az postgres flexible-server firewall-rule delete \
+            --resource-group "$EXPECTED_RESOURCE_GROUP" --server-name "$EXPECTED_SERVER" \
+            --name "$RULE" --yes
+          left=$(az postgres flexible-server firewall-rule list \
+            --resource-group "$EXPECTED_RESOURCE_GROUP" --server-name "$EXPECTED_SERVER" \
+            --query "[?name=='$RULE'] | length(@)" -o tsv)
+          if [ "$left" != "0" ]; then
+            echo "::error::firewall rule $RULE is still present"
+            exit 1
+          fi

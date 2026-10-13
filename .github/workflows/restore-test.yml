@@ -1,0 +1,185 @@
+# Proves every month that the backups can actually be restored, and how long
+# it takes.
+#
+# 1. Writes a "fresh" marker on the source, then picks a restore point 15
+#    minutes in the past (so the fresh marker must NOT come back).
+# 2. Restores the source to that point onto a new, temporary server.
+# 3. Compares row count and checksum of the known markers on both sides.
+# 4. Writes the measured RTO (restore + validation time) to the job summary.
+# 5. Deletes the temporary server in a step that always runs, and opens an
+#    issue if anything failed.
+name: restore-test
+
+on:
+  schedule:
+    - cron: "17 6 1 * *" # 06:17 UTC on the 1st of every month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+concurrency:
+  group: restore-test-pgdemo
+  cancel-in-progress: false
+
+env:
+  EXPECTED_SUBSCRIPTION_ID: "00000000-0000-0000-0000-000000000000"
+  RESOURCE_GROUP: rg-pgdemo-dev
+  SOURCE_SERVER: pgdemo-dev-psql
+  DATABASE: appdb
+  # Only servers with this prefix can be deleted by the cleanup step.
+  RESTORE_PREFIX: pgdemo-restore-
+  # Entra identity of this workflow, granted the app role (read + markers).
+  DB_PRINCIPAL: gh-pgdemo-restore-check
+  RTO_TARGET_MINUTES: "60"
+  NETWORK_MODE: firewall
+
+jobs:
+  restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: pgdemo-restore-test
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Sign in to Azure (OIDC, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.EXPECTED_SUBSCRIPTION_ID }}
+
+      - name: Check subscription, name the temporary server
+        run: |
+          actual_sub=$(az account show --query id -o tsv)
+          if [ "$actual_sub" != "$EXPECTED_SUBSCRIPTION_ID" ]; then
+            echo "::error::signed in to subscription $actual_sub, expected $EXPECTED_SUBSCRIPTION_ID"
+            exit 1
+          fi
+          runner_ip=$(curl -fsS https://api.ipify.org)
+          {
+            echo "RESTORE_SERVER=${RESTORE_PREFIX}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "RULE=gh-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "RUNNER_IP=$runner_ip"
+          } >>"$GITHUB_ENV"
+
+      - name: Open firewall on the source
+        id: source_firewall
+        if: env.NETWORK_MODE == 'firewall'
+        run: |
+          echo "opened=true" >>"$GITHUB_OUTPUT"
+          az postgres flexible-server firewall-rule create \
+            --resource-group "$RESOURCE_GROUP" --server-name "$SOURCE_SERVER" \
+            --name "$RULE" --start-ip-address "$RUNNER_IP" --end-ip-address "$RUNNER_IP" -o none
+
+      - name: Get a short-lived database token
+        run: |
+          token=$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          echo "PGPASSWORD=$token" >>"$GITHUB_ENV"
+
+      - name: Write a fresh marker and choose the restore point
+        env:
+          PGHOST: ${{ env.SOURCE_SERVER }}.postgres.database.azure.com
+          PGUSER: ${{ env.DB_PRINCIPAL }}
+          PGDATABASE: ${{ env.DATABASE }}
+          PGSSLMODE: require
+        run: |
+          fresh=$(psql -X -A -t -v ON_ERROR_STOP=1 -c "SELECT ops.write_marker('restore-test-run-${GITHUB_RUN_ID}')")
+          # Use the database clock, not the runner clock.
+          point=$(psql -X -A -t -v ON_ERROR_STOP=1 -c \
+            "SELECT to_char((now() - interval '15 minutes') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+          echo "FRESH_MARKER=$fresh" >>"$GITHUB_ENV"
+          echo "RESTORE_POINT=$point" >>"$GITHUB_ENV"
+          echo "Fresh marker $fresh, restore point $point"
+
+      - name: Restore to a temporary server
+        id: restore
+        run: |
+          echo "started=$(date +%s)" >>"$GITHUB_OUTPUT"
+          echo "RESTORE_STARTED=$(date +%s)" >>"$GITHUB_ENV"
+          az postgres flexible-server restore \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$RESTORE_SERVER" \
+            --source-server "$SOURCE_SERVER" \
+            --restore-time "$RESTORE_POINT" -o none
+          echo "RESTORE_FINISHED=$(date +%s)" >>"$GITHUB_ENV"
+
+      - name: Open firewall on the temporary server
+        if: env.NETWORK_MODE == 'firewall'
+        run: |
+          az postgres flexible-server firewall-rule create \
+            --resource-group "$RESOURCE_GROUP" --server-name "$RESTORE_SERVER" \
+            --name "$RULE" --start-ip-address "$RUNNER_IP" --end-ip-address "$RUNNER_IP" -o none
+
+      - name: Validate the restored data
+        run: |
+          scripts/restore-validate.sh \
+            --source   "host=${SOURCE_SERVER}.postgres.database.azure.com dbname=${DATABASE} user=${DB_PRINCIPAL} sslmode=require" \
+            --restored "host=${RESTORE_SERVER}.postgres.database.azure.com dbname=${DATABASE} user=${DB_PRINCIPAL} sslmode=require" \
+            --restore-point "$RESTORE_POINT" \
+            --fresh-marker "$FRESH_MARKER"
+          echo "VALIDATED=$(date +%s)" >>"$GITHUB_ENV"
+
+      - name: Report RTO
+        run: |
+          restore_s=$((RESTORE_FINISHED - RESTORE_STARTED))
+          total_s=$((VALIDATED - RESTORE_STARTED))
+          total_min=$(( (total_s + 59) / 60 ))
+          {
+            echo "### Restore test"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Source | \`$SOURCE_SERVER/$DATABASE\` |"
+            echo "| Restore point (UTC) | $RESTORE_POINT |"
+            echo "| Restore (server ready) | $((restore_s / 60)) min $((restore_s % 60)) s |"
+            echo "| **RTO** (restore + validation) | **$((total_s / 60)) min $((total_s % 60)) s** |"
+            echo "| RTO target | $RTO_TARGET_MINUTES min |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$total_min" -gt "$RTO_TARGET_MINUTES" ]; then
+            echo "::error::RTO ${total_min} min is above the ${RTO_TARGET_MINUTES} min target"
+            exit 1
+          fi
+
+      - name: Delete the temporary server
+        if: always() && steps.restore.outputs.started != ''
+        run: |
+          # Guard on the guard: this step may only ever delete a server it
+          # created, never the source.
+          case "$RESTORE_SERVER" in
+            "$RESTORE_PREFIX"*) ;;
+            *) echo "::error::refusing to delete $RESTORE_SERVER (no $RESTORE_PREFIX prefix)"; exit 1 ;;
+          esac
+          if [ "$RESTORE_SERVER" = "$SOURCE_SERVER" ]; then
+            echo "::error::refusing to delete the source server"; exit 1
+          fi
+          if az postgres flexible-server show --resource-group "$RESOURCE_GROUP" --name "$RESTORE_SERVER" -o none 2>/dev/null; then
+            az postgres flexible-server delete --resource-group "$RESOURCE_GROUP" --name "$RESTORE_SERVER" --yes
+          fi
+          if az postgres flexible-server show --resource-group "$RESOURCE_GROUP" --name "$RESTORE_SERVER" -o none 2>/dev/null; then
+            echo "::error::$RESTORE_SERVER still exists and keeps costing money"; exit 1
+          fi
+          echo "Deleted $RESTORE_SERVER"
+
+      - name: Close firewall on the source
+        if: always() && steps.source_firewall.outputs.opened == 'true'
+        run: |
+          az postgres flexible-server firewall-rule delete \
+            --resource-group "$RESOURCE_GROUP" --server-name "$SOURCE_SERVER" \
+            --name "$RULE" --yes
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Restore test failed ($(date -u +%Y-%m-%d))" \
+            --body "The monthly restore test failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Until a run passes again, the last proven restore is the previous green run of this workflow.
+          Check the job summary for which validation failed and whether the temporary server was deleted."
